@@ -198,9 +198,9 @@ def train_PG(exp_name='',
                             size=size)
         # logstd should just be a trainable variable, not a network output.
         sy_logstd = tf.get_variable(name='logstd', shape=[], dtype=tf.float32)
-        sy_sampled_ac = tf.random_normal(shape=[None, ac_dim], stddev=tf.exp(sy_logstd)) + sy_mean
-        # Hint: Use the log probability under a multivariate gaussian.
         mv_gass = MultivariateNormalDiag(loc=sy_mean, scale_identity_multiplier=tf.exp(sy_logstd))
+        sy_sampled_ac = mv_gass.sample(sample_shape=[ac_dim])[0]
+        # Hint: Use the log probability under a multivariate gaussian.
         sy_logprob_n = mv_gass.log_prob(sy_ac_na)
 
 
@@ -231,7 +231,7 @@ def train_PG(exp_name='',
         # Define placeholders for targets, a loss function and an update op for fitting a 
         # neural network baseline. These will be used to fit the neural network baseline. 
         # YOUR_CODE_HERE
-        sy_bl_target_n = tf.placeholder(shape=[None], dtype=tf.float32, name='baseline_target')
+        sy_bl_target_n = tf.placeholder(shape=[None, 1], dtype=tf.float32, name='baseline_target')
         baseline_loss = tf.losses.mean_squared_error(sy_bl_target_n, baseline_prediction)
         baseline_update_op = tf.train.AdamOptimizer(learning_rate).minimize(baseline_loss)
 
@@ -374,7 +374,6 @@ def train_PG(exp_name='',
             # Hint #bl1: rescale the output from the nn_baseline to match the statistics
             # (mean and std) of the current or previous batch of Q-values. (Goes with Hint
             # #bl2 below.)
-
             b_n = sess.run(baseline_prediction, feed_dict={sy_ob_no: ob_no})
             b_n = (b_n - np.mean(b_n)) / np.std(b_n)
             b_n = b_n * np.std(q_n) + np.mean(q_n)
@@ -410,7 +409,9 @@ def train_PG(exp_name='',
             # targets to have mean zero and std=1. (Goes with Hint #bl1 above.)
 
             # YOUR_CODE_HERE
-            sess.run(baseline_update_op, feed_dict={sy_bl_target_n: ((q_n - np.mean(q_n)) / np.std(q_n))})
+            sess.run(baseline_update_op, feed_dict={sy_bl_target_n: np.reshape(((q_n - np.mean(q_n)) / np.std(q_n)),
+                                                                               newshape=(-1, 1)),
+                                                    sy_ob_no: ob_no})
 
         #====================================================================================#
         #                           ----------SECTION 4----------
