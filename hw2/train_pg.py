@@ -8,6 +8,8 @@ import time
 import inspect
 from multiprocessing import Process
 from tensorflow.contrib.distributions import MultivariateNormalDiag
+from tensorflow.contrib.layers import xavier_initializer
+
 
 #============================================================================================#
 # Utilities
@@ -40,12 +42,14 @@ def build_mlp(
             hl = tf.layers.dense(inputs=prev_layer,
                                  units=size,
                                  activation=activation,
+                                 kernel_initializer=xavier_initializer(),
                                  name='HiddenLayer_{}'.format(l))
             prev_layer = hl
 
         output_layer = tf.layers.dense(inputs=prev_layer,
                                        units=output_size,
                                        activation=output_activation,
+                                       kernel_initializer=None, #xavier_initializer(),
                                        name='OutputLayer')
         return output_layer
 
@@ -137,6 +141,8 @@ def train_PG(exp_name='',
     # Define a placeholder for advantages
     sy_adv_n = tf.placeholder(shape=[None], name='adv', dtype=tf.float32)
 
+    sy_global_step = tf.placeholder(name='global_step', dtype=tf.int32, shape=[])
+    learning_rate = tf.train.exponential_decay(learning_rate, sy_global_step, n_iter, 0.96, staircase=False)
 
     #========================================================================================#
     #                           ----------SECTION 4----------
@@ -194,15 +200,20 @@ def train_PG(exp_name='',
         sy_mean = build_mlp(input_placeholder=sy_ob_no,
                             output_size=ac_dim,
                             scope='policy_continuous',
+                            activation=tf.tanh,
+                            output_activation=None,
                             n_layers=n_layers,
                             size=size)
         # logstd should just be a trainable variable, not a network output.
-        sy_logstd = tf.get_variable(name='logstd', shape=[], dtype=tf.float32)
-        mv_gass = MultivariateNormalDiag(loc=sy_mean, scale_identity_multiplier=tf.exp(sy_logstd))
-        sy_sampled_ac = mv_gass.sample(sample_shape=[ac_dim])[0]
+        sy_logstd = tf.get_variable(name='logstd', shape=[], dtype=tf.float32, initializer=xavier_initializer())
+        #mv_gass = MultivariateNormalDiag(loc=sy_mean, scale_identity_multiplier=sy_logstd)
+        #sy_sampled_ac = mv_gass.sample(sample_shape=[ac_dim])[0]
+        #sy_logprob_n = mv_gass.log_prob(sy_ac_na)
         # Hint: Use the log probability under a multivariate gaussian.
-        sy_logprob_n = mv_gass.log_prob(sy_ac_na)
+        sy_var = tf.maximum(tf.square(tf.exp(sy_logstd)), 1e-6)
 
+        sy_sampled_ac = sy_mean + tf.sqrt(sy_var) * tf.random_normal(shape=[ac_dim])
+        sy_logprob_n = (tf.log(2 * np.pi) + 2*sy_logstd) * (-ac_dim / 2) - 0.5 * tf.norm(sy_ac_na - sy_mean, axis=1)**2 / sy_var
 
 
     #========================================================================================#
@@ -226,6 +237,7 @@ def train_PG(exp_name='',
                                 sy_ob_no, 
                                 1, 
                                 "nn_baseline",
+                                output_activation=None,
                                 n_layers=n_layers,
                                 size=size))
         # Define placeholders for targets, a loss function and an update op for fitting a 
@@ -346,6 +358,9 @@ def train_PG(exp_name='',
         #====================================================================================#
 
         # YOUR_CODE_HERE
+        #
+        '''
+        # Just FYI: The following code is wrong
         def _discounted_rewards(rewards, gamma):
             discount = gamma * np.ones(len(rewards))
             discount[0] = 1
@@ -355,12 +370,24 @@ def train_PG(exp_name='',
             sum_ret = np.sum(rewards)
             ret = np.repeat(sum_ret, len(rewards))
             if reward_to_go:
-                ret[1:] = ret[1:] - np.cumsum(rewards[1:])
+                ret[1:] = ret[1:] - np.cumsum(rewards[:-1])
 
             return ret
+        q_n = np.concatenate([_accum_ret(_discounted_rewards(path['reward'], gamma), reward_to_go) for path in paths], axis=0)
+        '''
 
-        q_n = np.concatenate([_accum_ret(_discounted_rewards(path['reward'], gamma), reward_to_go) for path in paths])
+        q_n = []
+        for path in paths:
+            r = path["reward"]
+            max_step = len(r)
+            if reward_to_go:
+                q = [np.sum(np.power(gamma, np.arange(max_step - t)) * r[t:]) for t in range(max_step)]
+            else:
+                q = [np.sum(np.power(gamma, np.arange(max_step)) * r) for t in range(max_step)]
+            q_n.extend(q)
 
+
+        epslon = 1e-7
         #====================================================================================#
         #                           ----------SECTION 5----------
         # Computing Baselines
@@ -375,8 +402,7 @@ def train_PG(exp_name='',
             # (mean and std) of the current or previous batch of Q-values. (Goes with Hint
             # #bl2 below.)
             b_n = sess.run(baseline_prediction, feed_dict={sy_ob_no: ob_no})
-            b_n = (b_n - np.mean(b_n)) / np.std(b_n)
-            b_n = b_n * np.std(q_n) + np.mean(q_n)
+            b_n = np.mean(q_n, axis=0) + b_n * np.std(q_n, axis=0)
             adv_n = q_n - b_n
         else:
             adv_n = q_n.copy()
@@ -390,7 +416,7 @@ def train_PG(exp_name='',
             # On the next line, implement a trick which is known empirically to reduce variance
             # in policy gradient methods: normalize adv_n to have mean zero and std=1. 
             # YOUR_CODE_HERE
-            adv_n = (adv_n - np.mean(adv_n)) / np.std(adv_n)
+            adv_n = (adv_n - np.mean(adv_n, axis=0)) / (np.std(adv_n, axis=0) + epslon)
 
 
         #====================================================================================#
@@ -409,9 +435,10 @@ def train_PG(exp_name='',
             # targets to have mean zero and std=1. (Goes with Hint #bl1 above.)
 
             # YOUR_CODE_HERE
-            sess.run(baseline_update_op, feed_dict={sy_bl_target_n: np.reshape(((q_n - np.mean(q_n)) / np.std(q_n)),
+            sess.run(baseline_update_op, feed_dict={sy_bl_target_n: np.reshape((q_n - np.mean(q_n, axis=0)) / (np.std(q_n, axis=0) + epslon),
                                                                                newshape=(-1, 1)),
-                                                    sy_ob_no: ob_no})
+                                                    sy_ob_no: ob_no,
+                                                    sy_global_step: itr})
 
         #====================================================================================#
         #                           ----------SECTION 4----------
@@ -425,8 +452,9 @@ def train_PG(exp_name='',
         # and after an update, and then log them below. 
 
         # YOUR_CODE_HERE
-        policy_loss_before, _ = sess.run([loss, update_op], feed_dict={sy_adv_n: adv_n, sy_ob_no: ob_no, sy_ac_na: ac_na})
-        policy_loss_after = sess.run(loss, feed_dict={sy_adv_n: adv_n, sy_ob_no: ob_no, sy_ac_na: ac_na})
+        policy_loss_before, _ = sess.run([loss, update_op], feed_dict={sy_adv_n: adv_n, sy_ob_no: ob_no,
+                                                                       sy_ac_na: ac_na, sy_global_step: itr})
+        policy_loss_after, logprob1 = sess.run([loss, sy_logprob_n], feed_dict={sy_adv_n: adv_n, sy_ob_no: ob_no, sy_ac_na: ac_na})
 
         # Log diagnostics
         returns = [path["reward"].sum() for path in paths]
@@ -443,6 +471,7 @@ def train_PG(exp_name='',
         logz.log_tabular("TimestepsSoFar", total_timesteps)
         logz.log_tabular("PolicyLossBeforeUpdate", policy_loss_before)
         logz.log_tabular("PolicyLossAfterUpdate", policy_loss_after)
+        logz.log_tabular("logprob1", logprob1[0])
         logz.dump_tabular()
         logz.pickle_tf_vars()
 
