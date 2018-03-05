@@ -1,7 +1,9 @@
 import sys
 import gym.spaces
 import itertools
+import logz
 import numpy as np
+import os
 import random
 import tensorflow                as tf
 import tensorflow.contrib.layers as layers
@@ -9,6 +11,13 @@ from collections import namedtuple
 from dqn_utils import *
 
 OptimizerSpec = namedtuple("OptimizerSpec", ["constructor", "kwargs", "lr_schedule"])
+
+
+def choose_q_value_with_action(sy_q_valuess_na, sy_action_n, num_actions):
+    act_one_hot = tf.one_hot(sy_action_n, num_actions, dtype=tf.int32)
+    sy_q_val_n = tf.boolean_mask(sy_q_valuess_na, tf.cast(act_one_hot, tf.bool))
+    return sy_q_val_n
+
 
 def learn(env,
           q_func,
@@ -23,7 +32,8 @@ def learn(env,
           learning_freq=4,
           frame_history_len=4,
           target_update_freq=10000,
-          grad_norm_clipping=10):
+          grad_norm_clipping=10,
+          ddqn=False):
     """Run Deep Q-learning algorithm.
 
     You can specify your own convnet using q_func.
@@ -77,6 +87,10 @@ def learn(env,
     assert type(env.observation_space) == gym.spaces.Box
     assert type(env.action_space)      == gym.spaces.Discrete
 
+    if not(os.path.exists('data')):
+        os.makedirs('data')
+    logz.configure_output_dir('./log')
+
     ###############
     # BUILD MODEL #
     ###############
@@ -128,7 +142,28 @@ def learn(env,
     ######
     
     # YOUR CODE HERE
+    sy_q_val_na = q_func(obs_t_float, num_actions, scope='q_nn', reuse=False)
+    sy_q_val_target_na = q_func(obs_tp1_float, num_actions, scope='q_target_nn', reuse=False)
+    print('obs_t_ph: ', obs_t_ph.shape)
+    print('obs_t_float: ', obs_t_float.shape)
+    print('sy_q_val_target_na: ', sy_q_val_target_na.shape)
 
+    if ddqn is True:
+        # DDQN: use current network to choose action,  use target network to evaluate next Q value
+        sy_act_next_n = tf.reduce_max(q_func(obs_tp1_float, num_actions, scope='q_nn', reuse=True))
+        sy_q_next_n = choose_q_value_with_action(sy_q_val_target_na, sy_act_next_n, num_actions)
+    else:
+        sy_q_next_n = tf.reduce_max(sy_q_val_target_na, axis=1)
+
+    sy_bellman_target_n = rew_t_ph + \
+        gamma * tf.multiply(sy_q_next_n, (1 - done_mask_ph))
+    print('sy_bellman_target_n: ', sy_bellman_target_n.shape)
+    sy_q_pred_n = choose_q_value_with_action(sy_q_val_na, act_t_ph, num_actions)
+    print('sy_q_pred_n: ', sy_q_pred_n.shape)
+    total_error = tf.losses.mean_squared_error(sy_bellman_target_n, predictions=sy_q_pred_n)
+
+    q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_nn')
+    target_q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_target_nn')
     ######
 
     # construct optimization op (with gradient clipping)
@@ -155,7 +190,12 @@ def learn(env,
     mean_episode_reward      = -float('nan')
     best_mean_episode_reward = -float('inf')
     last_obs = env.reset()
-    LOG_EVERY_N_STEPS = 10000
+    LOG_EVERY_N_STEPS = 1000
+    save_every_n_steps = 10000
+
+    model_chkpt = './model/model.ckpt'
+    saver = tf.train.Saver()
+
 
     for t in itertools.count():
         ### 1. Check stopping criterion
@@ -195,6 +235,31 @@ def learn(env,
         #####
         
         # YOUR CODE HERE
+        # store last_obs to replay buffer
+        idx = replay_buffer.store_frame(last_obs)
+
+        # encode last_obs and feed to q nn to evaluate the action logits
+        if model_initialized:
+            obs_feed = [replay_buffer.encode_recent_observation()]
+            # obs_feed = np.reshape(obs_feed, (-1,) + obs_feed.shape)
+            q_vals = session.run(sy_q_val_na, feed_dict={obs_t_ph: obs_feed})
+            # perform epslon exploration to choose the next action
+            epslon = exploration.value(t)
+            if np.random.random() < epslon:
+                next_action = np.random.randint(0, num_actions)
+            else:
+                next_action = np.argmax(q_vals)
+        else:
+            next_action = np.random.randint(0, num_actions)
+
+        # advance one step to the environment with the action
+        last_obs, reward, done, _ = env.step(next_action)
+
+        # store effect for the action taken
+        replay_buffer.store_effect(idx, next_action, reward, done)
+
+        if done is True:
+            last_obs = env.reset()
 
         #####
 
@@ -245,8 +310,39 @@ def learn(env,
             #####
             
             # YOUR CODE HERE
+            # sample from replay buffer
+            obs_t_batch, act_t_batch, rwd_t_batch, obs_tp1_batch, done_mask_batch = replay_buffer.sample(batch_size)
 
-            #####
+            # initialize the model if not
+            if not model_initialized:
+                model_dir = './model'
+                if not os.path.exists(model_dir):
+                    os.mkdir(model_dir)
+                if os.listdir(model_dir):
+                    saver.restore(session, model_chkpt)
+                else:
+                    initialize_interdependent_variables(session, tf.global_variables(), {
+                                obs_t_ph: obs_t_batch,
+                                obs_tp1_ph: obs_tp1_batch,
+                            })
+                model_initialized = True
+
+            # train the model
+            _ = session.run(train_fn, feed_dict={obs_t_ph: obs_t_batch,
+                                                 act_t_ph: act_t_batch,
+                                                 rew_t_ph: rwd_t_batch,
+                                                 obs_tp1_ph: obs_tp1_batch,
+                                                 done_mask_ph: done_mask_batch,
+                                                 learning_rate: optimizer_spec.lr_schedule.value(t)})
+
+            # update target nn periodically
+            num_param_updates += 1
+            if num_param_updates > target_update_freq:
+                _ = session.run(update_target_fn, feed_dict={})
+
+                num_param_updates = 0
+
+                #####
 
         ### 4. Log progress
         episode_rewards = get_wrapper_by_name(env, "Monitor").get_episode_rewards()
@@ -254,11 +350,15 @@ def learn(env,
             mean_episode_reward = np.mean(episode_rewards[-100:])
         if len(episode_rewards) > 100:
             best_mean_episode_reward = max(best_mean_episode_reward, mean_episode_reward)
+
         if t % LOG_EVERY_N_STEPS == 0 and model_initialized:
-            print("Timestep %d" % (t,))
-            print("mean reward (100 episodes) %f" % mean_episode_reward)
-            print("best mean reward %f" % best_mean_episode_reward)
-            print("episodes %d" % len(episode_rewards))
-            print("exploration %f" % exploration.value(t))
-            print("learning_rate %f" % optimizer_spec.lr_schedule.value(t))
-            sys.stdout.flush()
+            logz.log_tabular("Timestep", t)
+            logz.log_tabular('MeanEpisodeReward', mean_episode_reward)
+            logz.log_tabular('BestMeanEpisodeReward', best_mean_episode_reward)
+            logz.log_tabular('episodes', len(episode_rewards))
+            logz.log_tabular('exploration', exploration.value(t))
+            logz.log_tabular('learning_rate', optimizer_spec.lr_schedule.value(t))
+            logz.dump_tabular()
+
+        if model_initialized and t % save_every_n_steps == 0:
+            saver.save(session, model_chkpt)
